@@ -1,4 +1,4 @@
-name: CI/CD with Kind (Local K8s)
+name: CI/CD with Kind (Kubernetes in Docker)
 
 on:
   push:
@@ -21,10 +21,16 @@ jobs:
     - name: Install dependencies
       run: npm install
     
-    - name: Set up Kind Kubernetes cluster
-      uses: container-tools/action-kind@v1
-      with:
-        version: "v0.20.0"
+    - name: Set up Kind
+      run: |
+        # Установка Kind
+        curl -Lo ./kind https://kind.sigs.k8s.io/dl/v0.20.0/kind-linux-amd64
+        chmod +x ./kind
+        sudo mv ./kind /usr/local/bin/
+        
+        # Создание кластера
+        kind create cluster --name todo-cluster
+        kind get kubeconfig --name todo-cluster > kubeconfig.yaml
     
     - name: Build Docker image
       run: |
@@ -33,26 +39,53 @@ jobs:
     
     - name: Load image into Kind
       run: |
-        kind load docker-image todo-app:latest
-        kind load docker-image todo-app:${{ github.sha }}
+        kind load docker-image --name todo-cluster todo-app:latest
+        kind load docker-image --name todo-cluster todo-app:${{ github.sha }}
+    
+    - name: Set up kubectl
+      run: |
+        curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+        chmod +x kubectl
+        sudo mv kubectl /usr/local/bin/
+        
+        # Используем kubeconfig от Kind
+        export KUBECONFIG=kubeconfig.yaml
     
     - name: Deploy MongoDB
       run: |
         kubectl apply -f mongo-deployment.yaml
-        kubectl wait --for=condition=ready pod -l app=mongodb --timeout=120s
+        echo "Waiting for MongoDB..."
+        sleep 30
     
     - name: Deploy Todo App
       run: |
+        # Создаем ConfigMap
+        kubectl apply -f configmap.yaml
+        
+        # Деплоим приложение
         kubectl apply -f todo-app-deployment.yaml
-        kubectl rollout status deployment/todo-app-deployment --timeout=120s
+        
+        # Ждем готовности
+        kubectl wait --for=condition=available --timeout=120s deployment/todo-app-deployment
     
     - name: Verify deployment
       run: |
+        echo "=== Cluster Info ==="
+        kubectl cluster-info
+        
+        echo ""
         echo "=== Pods ==="
         kubectl get pods
+        
         echo ""
         echo "=== Services ==="
         kubectl get services
+        
         echo ""
         echo "=== Deployments ==="
         kubectl get deployments
+    
+    - name: Clean up Kind cluster
+      if: always()
+      run: |
+        kind delete cluster --name todo-cluster
