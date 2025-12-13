@@ -1,4 +1,4 @@
-name: CI/CD with Kind (Kubernetes in Docker)
+name: CI/CD with Debugging
 
 on:
   push:
@@ -28,9 +28,27 @@ jobs:
         chmod +x ./kind
         sudo mv ./kind /usr/local/bin/
         
-        # Создание кластера
-        kind create cluster --name todo-cluster
+        # Создание кластера с дополнительной конфигурацией
+        cat <<EOF > kind-config.yaml
+        kind: Cluster
+        apiVersion: kind.x-k8s.io/v1alpha4
+        nodes:
+        - role: control-plane
+          extraPortMappings:
+          - containerPort: 30001
+            hostPort: 30001
+            protocol: TCP
+        EOF
+        
+        kind create cluster --name todo-cluster --config kind-config.yaml
         kind get kubeconfig --name todo-cluster > kubeconfig.yaml
+    
+    - name: Configure kubectl
+      run: |
+        curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+        chmod +x kubectl
+        sudo mv kubectl /usr/local/bin/
+        export KUBECONFIG=kubeconfig.yaml
     
     - name: Build Docker image
       run: |
@@ -42,20 +60,24 @@ jobs:
         kind load docker-image --name todo-cluster todo-app:latest
         kind load docker-image --name todo-cluster todo-app:${{ github.sha }}
     
-    - name: Set up kubectl
-      run: |
-        curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
-        chmod +x kubectl
-        sudo mv kubectl /usr/local/bin/
-        
-        # Используем kubeconfig от Kind
-        export KUBECONFIG=kubeconfig.yaml
-    
-    - name: Deploy MongoDB
+    - name: Deploy MongoDB with more time
       run: |
         kubectl apply -f mongo-deployment.yaml
-        echo "Waiting for MongoDB..."
-        sleep 30
+        echo "Waiting for MongoDB to be ready..."
+        
+        # Ждем дольше и с проверкой
+        for i in {1..60}; do
+          if kubectl get pods -l app=mongodb -o jsonpath='{.items[0].status.phase}' 2>/dev/null | grep -q Running; then
+            echo "✅ MongoDB is running"
+            break
+          fi
+          echo "Waiting for MongoDB... ($i/60)"
+          sleep 5
+        done
+        
+        # Проверяем логи MongoDB
+        echo "=== MongoDB logs ==="
+        kubectl logs -l app=mongodb --tail=20 || true
     
     - name: Deploy Todo App
       run: |
@@ -65,27 +87,82 @@ jobs:
         # Деплоим приложение
         kubectl apply -f todo-app-deployment.yaml
         
-        # Ждем готовности
-        kubectl wait --for=condition=available --timeout=120s deployment/todo-app-deployment
+        echo "Waiting for Todo App to start..."
+        
+        # Проверяем логи во время ожидания
+        for i in {1..40}; do
+          echo "Checking deployment status... ($i/40)"
+          
+          # Показываем статус подов
+          kubectl get pods -l app=todo-app
+          
+          # Проверяем логи если под существует
+          POD_NAME=$(kubectl get pods -l app=todo-app -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
+          if [ ! -z "$POD_NAME" ]; then
+            echo "=== Pod logs ($POD_NAME) ==="
+            kubectl logs $POD_NAME --tail=10 || true
+          fi
+          
+          # Проверяем готовность
+          if kubectl get deployment todo-app-deployment -o jsonpath='{.status.readyReplicas}' 2>/dev/null | grep -q 1; then
+            echo "✅ Todo App deployment is ready!"
+            break
+          fi
+          
+          sleep 5
+        done
     
-    - name: Verify deployment
+    - name: Debug if failed
+      if: failure()
       run: |
-        echo "=== Cluster Info ==="
-        kubectl cluster-info
+        echo "=== DEBUG INFO ==="
+        echo ""
+        echo "=== All resources ==="
+        kubectl get all
         
         echo ""
-        echo "=== Pods ==="
-        kubectl get pods
+        echo "=== Pod details ==="
+        kubectl describe pods -l app=todo-app
         
         echo ""
-        echo "=== Services ==="
-        kubectl get services
+        echo "=== Deployment details ==="
+        kubectl describe deployment todo-app-deployment
         
         echo ""
-        echo "=== Deployments ==="
-        kubectl get deployments
+        echo "=== MongoDB status ==="
+        kubectl get pods -l app=mongodb
+        kubectl describe pod -l app=mongodb
+        
+        echo ""
+        echo "=== Service details ==="
+        kubectl describe service todo-app-service
+        
+        echo ""
+        echo "=== Events ==="
+        kubectl get events --sort-by='.lastTimestamp'
     
-    - name: Clean up Kind cluster
+    - name: Verify connection
+      if: success()
+      run: |
+        echo "=== Testing application ==="
+        
+        # Получаем IP сервиса
+        SERVICE_IP=$(kubectl get service todo-app-service -o jsonpath='{.spec.clusterIP}')
+        echo "Service IP: $SERVICE_IP"
+        
+        # Пробуем подключиться
+        kubectl run test-curl --image=curlimages/curl:8.5.0 --restart=Never --rm -i --command -- \
+          sh -c "echo 'Testing connection to todo app...' && \
+                 timeout 30 curl -f http://todo-app-service/health || \
+                 echo '⚠️ Direct connection failed, checking from inside cluster...'"
+        
+        # Проверяем изнутри пода
+        POD_NAME=$(kubectl get pods -l app=todo-app -o jsonpath='{.items[0].metadata.name}')
+        echo "=== Checking from inside the pod ==="
+        kubectl exec $POD_NAME -- curl -s http://localhost:3000/health || \
+          echo "⚠️ Health check failed from inside pod"
+    
+    - name: Clean up
       if: always()
       run: |
         kind delete cluster --name todo-cluster
